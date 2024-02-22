@@ -1,0 +1,376 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sensorscape
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: sensorscape
+  template:
+    metadata:
+      labels:
+        app: sensorscape
+    spec:
+      securityContext:
+        # 1001 is picked as an arbitrary non-root userID
+        runAsUser: 1001
+        runAsGroup: 3000
+        fsGroup: 2000
+      containers:
+        - name: sensorscape
+          # Optum-best practice: pull your docker image from artifactory
+          image: docker.repo1.uhc.com/eutsbi_aiml/sensorscape:latest
+          securityContext:
+            # These are required/standard practice for security reasons
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop:
+                - KILL
+                - MKNOD
+                - SYS_CHROOT
+          #We create a volume wit the following path with read-write access so that we can store streamlit cache objects
+          volumeMounts:
+            - mountPath: /.streamlit
+              name: cache-volume
+            - mountPath: "/files"
+              name: task-pv-storage
+          resources:
+            # requests:
+            #   cpu: 1
+            #   memory: 400Mi
+            limits:
+              cpu: 4
+              memory: 16Gi
+          ports:
+            # This matches the port the app in the container listens on
+            #We choose 8501 for everything because this is the port that Streamlit defaulty runs on
+            - containerPort: 8501
+              name: http
+          #We create these probes to test the deployment of our
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8501
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 10
+            timeoutSeconds: 15
+          livenessProbe:
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 10
+            timeoutSeconds: 15
+            httpGet:
+              path: /
+              port: 8501
+      volumes:
+        - name: cache-volume
+          emptyDir:
+            sizeLimit: 500Mi
+        - name: task-pv-storage
+          persistentVolumeClaim:
+            claimName: sensorscape-storage
+
+# Optionally, could use a simple TCP socket connect (quicker/simpler, but not as robust)
+#            tcpSocket:
+#              port: 5000
+# Or - if the app isn't starting, and you want the pod to stay up long enough
+# to exec in and debug, you can use this (will always succeed and keep pod from crashing)
+#            exec:
+#              command:
+#              - /bin/true
+---
+apiVersion: v1
+kind: PersistentVolumeClaim #claim a persistent volume to store files
+metadata:
+  labels:
+    component: "server"
+    app: sensorscape
+  name: sensorscape-storage
+  # since ingress objects are defined in system/shared space, we need to instruct Kubernetes
+  # where to find the service name (below) - make sure this matches your HCC Kubernetes namespace
+  namespace: test-sensorscape
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: "nas-thin"
+  resources:
+    requests:
+      storage: "32Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  # this is the name of your service
+  name: sensorscape-service
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      # this is the port number the service listens on; for simplicity, we keep it the same as the port the actual container listens on, but it could be different
+      port: 8501
+      protocol: TCP
+      targetPort: 8501
+  selector:
+    # this name must match the "metadata/name" from Deployment
+    app: sensorscape
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sensorscape
+spec:
+  podSelector:
+    matchLabels:
+      # this must match label defined in deployment.yaml
+      app: sensorscape
+  policyTypes:
+    - Ingress
+    - Egress
+  egress:
+    # Important to whitelist these IP ranges and their ports so that Snowflake or any other egress connection can be made outside of the pods
+    - to:
+        - ipBlock:
+            cidr: 45.0.0.0/24
+    - to:
+        - ipBlock:
+            cidr: 52.0.0.0/24
+    - to:
+        - ipBlock:
+            cidr: 54.0.0.0/24
+    - to:
+        - ipBlock:
+            cidr: 18.0.0.0/24
+    - to:
+        - ipBlock:
+            cidr: 104.0.0.0/24
+    - to:
+        - ipBlock:
+            cidr: 192.0.0.0/24
+    - to:
+        - ipBlock:
+            cidr: 162.0.0.0/24
+    - to:
+        - ipBlock:
+            cidr: 20.0.0.0/24
+    - ports:
+        - port: 443
+          protocol: UDP
+        - port: 443
+          protocol: TCP
+  ingress:
+    #Ingress is  the connections being made to the pod to interact with the application
+    - ports:
+        # we restrict inbound calls to the container to be only on port 8501 as that's
+        # what it listens on. Note 80/443 is used by the shared ingress, but that connection
+        # is proxied to port 5000. This policy is between the ingress and the container.
+        - protocol: TCP
+          port: 8501
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler # this is to enable horizontal scaling when app demand grows
+metadata:
+  name: sensorscape-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: sensorscape
+  minReplicas: 1
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 5
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  # this is the name of the ingress object
+  name: "sensorscape-ingress"
+  # since ingress objects are defined in system/shared space, we need to instruct Kubernetes
+  # where to find the service name (below) - make sure this matches your HCC Kubernetes namespace
+  namespace: "test-sensorscape"
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+
+    # ingressclass.kubernetes.io/is-default-class: "true"
+    # These 2 lines will create a DNS alias (CNAME) to the proper HCC Kubernetes shared ingress
+    external-dns.alpha.kubernetes.io/hostname: "systrack-sensorscape-deploy.hcck8s-ctc-np101.optum.com"
+    external-dns.alpha.kubernetes.io/ttl: "3600"
+
+spec:
+  ingressClassName: nginx
+  # defaultBackend:
+  #   serviceName: ingress-nginx-controller
+  #   servicePort: 8501
+  # tls:
+  #   - hosts:
+  #       - "systrack-sensorscape.hcck8s-ctc-np101.optum.com"
+  #     secretName: "ingresstlssecret"
+  rules:
+    # HCC Kubernetes shared ingress works like vhosts in apache/nginx/etc - where they match
+    # based on the HTTP Host header. This must match the same FQDN (hostname) used in the above annotations.
+    #This is  the DNS name that was created in HCP console
+    - host: "systrack-sensorscape-deploy.hcck8s-ctc-np101.optum.com"
+      http:
+        paths:
+          - pathType: Prefix
+            # i.e. match requests with '/*' as the URL
+            path: "/"
+            backend:
+              # send matching reuqests to this backend service
+              service:
+                # this name must match the metadata/name in LoadBalancer service
+                name: "sensorscape-service"
+                port:
+                  # this port number must match the port the service is running on (in Service)
+                  number: 8501
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sensorscape-api
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: sensorscape-api
+  template:
+    metadata:
+      labels:
+        app: sensorscape-api
+    spec:
+      securityContext:
+        # 1001 is picked as an arbitrary non-root userID
+        runAsUser: 1001
+        runAsGroup: 3000
+        fsGroup: 2000
+      containers:
+        - name: sensorscape-api
+          # Optum-best practice: pull your docker image from artifactory
+          image: docker.repo1.uhc.com/eutsbi_aiml/sensorscape-api:latest
+          securityContext:
+            # These are required/standard practice for security reasons
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop:
+                - KILL
+                - MKNOD
+                - SYS_CHROOT
+          #We create a volume wit the following path with read-write access so that we can store streamlit cache objects
+          volumeMounts:
+            - mountPath: "/files"
+              name: task-pv-storage
+          resources:
+            # requests:
+            #   cpu: 1
+            #   memory: 400Mi
+            limits:
+              cpu: 2
+              memory: 4Gi
+          ports:
+            # This matches the port the app in the container listens on
+            #We choose 8501 for everything because this is the port that Streamlit defaulty runs on
+            - containerPort: 8080
+              name: http
+          #We create these probes to test the deployment of our
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 30
+          livenessProbe:
+            initialDelaySeconds: 30
+            httpGet:
+              path: /
+              port: 8080
+      volumes:
+        - name: task-pv-storage
+          persistentVolumeClaim:
+            claimName: sensorscape-storage
+---
+apiVersion: v1
+kind: Service
+metadata:
+  # this is the name of your service
+  name: sensorscape-api-service
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      # this is the port number the service listens on; for simplicity, we keep it the same as the port the actual container listens on, but it could be different
+      port: 8080
+      protocol: TCP
+      targetPort: 8080
+  selector:
+    # this name must match the "metadata/name" from Deployment
+    app: sensorscape-api
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sensorscape-api
+spec:
+  podSelector:
+    matchLabels:
+      # this must match label defined in deployment.yaml
+      app: sensorscape-api
+  policyTypes:
+    - Ingress
+  ingress:
+    #Ingress is  the connections being made to the pod to interact with the application
+    - ports:
+        # we restrict inbound calls to the container to be only on port 8501 as that's
+        # what it listens on. Note 80/443 is used by the shared ingress, but that connection
+        # is proxied to port 8080. This policy is between the ingress and the container.
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  # this is the name of the ingress object
+  name: "sensorscape-api-ingress"
+  # since ingress objects are defined in system/shared space, we need to instruct Kubernetes
+  # where to find the service name (below) - make sure this matches your HCC Kubernetes namespace
+  namespace: "test-sensorscape"
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+
+    # ingressclass.kubernetes.io/is-default-class: "true"
+    # These 2 lines will create a DNS alias (CNAME) to the proper HCC Kubernetes shared ingress
+    external-dns.alpha.kubernetes.io/hostname: "systrack-sensorscape-api.hcck8s-ctc-np101.optum.com"
+    external-dns.alpha.kubernetes.io/ttl: "3600"
+
+spec:
+  ingressClassName: nginx
+  rules:
+    # HCC Kubernetes shared ingress works like vhosts in apache/nginx/etc - where they match
+    # based on the HTTP Host header. This must match the same FQDN (hostname) used in the above annotations.
+    #This is  the DNS name that was created in HCP console
+    - host: "systrack-sensorscape-api.hcck8s-ctc-np101.optum.com"
+      http:
+        paths:
+          - pathType: Prefix
+            # i.e. match requests with '/*' as the URL
+            path: "/"
+            backend:
+              # send matching requests to this backend service
+              service:
+                # this name must match the metadata/name in LoadBalancer service
+                name: "sensorscape-api-service"
+                port:
+                  # this port number must match the port the service is running on (in Service)
+                  number: 8080
